@@ -52,7 +52,7 @@
     ```env
     GEMINI_API_KEY=your_gemini_api_key_here
     N8N_API_KEY=your_n8n_api_key
-    N8N_BASE_URL=http://localhost:5678
+    N8N_BASE_URL= your_n8n_url
     ```
 
 ## ▶️ Usage
