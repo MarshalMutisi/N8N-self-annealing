@@ -27,8 +27,15 @@ os.makedirs(".tmp", exist_ok=True)
 def load_heal_log() -> List[Dict]:
     """Load healing attempt history for learning."""
     if os.path.exists(HEAL_LOG_FILE):
-        with open(HEAL_LOG_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(HEAL_LOG_FILE, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    return []
+                return json.loads(content)
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"⚠️ Warning: Failed to load {HEAL_LOG_FILE}: {str(e)}")
+            return []
     return []
 
 
@@ -82,7 +89,7 @@ def find_error_recursive(data) -> Optional[str]:
 
 def get_execution_error(execution_id: str) -> Optional[str]:
     """Fetch the actual error message from an execution."""
-    url = f"{N8N_URL}/api/v1/executions/{execution_id}"
+    url = f"{N8N_URL}/api/v1/executions/{execution_id}?includeData=true"
     headers = {"X-N8N-API-KEY": N8N_KEY}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
@@ -125,7 +132,7 @@ def heal_execution(execution_id: str, workflow_id: str, error_msg: str) -> Tuple
         return True, "resolved", "✅ Rate limit detected. RECOMMENDED: Add a 'Wait' node before API calls. Set delay to 1-5 seconds."
     
     # 3. JSON / Syntax Errors -> Attempt to fix code nodes
-    if any(pattern in error_lower for pattern in ["json", "parse", "syntax", "unexpected token"]):
+    if any(pattern in error_lower for pattern in ["json", "parse", "syntax", "unexpected token", "is not a function", "not defined"]):
         # Import healing functions from api.py
         try:
             from execution.api import fix_code_node_in_workflow, publish_workflow

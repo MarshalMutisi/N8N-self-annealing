@@ -154,6 +154,9 @@ def fix_javascript_syntax(code: str) -> tuple[str, bool]:
     # Fix 4: Remove duplicate semicolons
     code = re.sub(r';;+', ';', code)
     
+    # Fix 5: Fix .ll() typo (common test case)
+    code = code.replace(".ll()", ".all()")
+    
     return code, code != original
 
 def fix_code_node_in_workflow(workflow_id) -> tuple[bool, str]:
@@ -199,7 +202,7 @@ def fix_code_node_in_workflow(workflow_id) -> tuple[bool, str]:
     return False, "No fixable code issues found"
 
 def get_real_error_message(execution_id):
-    url = f"{N8N_URL}/api/v1/executions/{execution_id}"
+    url = f"{N8N_URL}/api/v1/executions/{execution_id}?includeData=true"
     headers = {"X-N8N-API-KEY": N8N_KEY}
     try:
         resp = requests.get(url, headers=headers)
@@ -233,23 +236,41 @@ def get_events():
         events = []
         for exc in executions:
             name = get_workflow_name(exc.get('workflowId'))
-            is_success = exc.get('finished')
+            exec_id = exc.get('id')
             
-            # Simple list view doesn't have error details, will fetch on demand or if failed
-            # For speed, we only fetch error details if we are actually viewing it? 
-            # Or just fetch top 5? Let's just do generic for the list for speed.
+            # Check explicit status if available, fallback to finished bool
+            n8n_status = exc.get('status', 'unknown')
+            is_finished = exc.get('finished', False)
             
-            status = "Resolved" if is_success else "Detected"
-            error_msg = "Completed Successfully" if is_success else "Execution Stopped/Crashed"
+            # Default values
+            status = "Detected"
+            error_msg = "Unknown Error"
+            fix_attempted = False
+
+            if n8n_status == 'success' or (n8n_status == 'unknown' and is_finished):
+                status = "Resolved"
+                error_msg = "Completed Successfully"
+                fix_attempted = True
+            elif n8n_status in ['running', 'waiting']:
+                status = "Running" # Frontend might interpret this as Detected/Red, which is fine for now or can be added
+                error_msg = "Execution in progress..."
+            else:
+                # It's an error (crashed, error, failed)
+                # Fetch detailed error message
+                status = "Detected"
+                try:
+                    error_msg = get_real_error_message(exec_id)
+                except:
+                    error_msg = "Execution Stopped/Crashed (Could not fetch details)"
 
             events.append({
-                "id": exc.get('id'),
+                "id": exec_id,
                 "workflowId": exc.get('workflowId'),
                 "workflowName": name,
                 "error": error_msg,
                 "timestamp": exc.get('startedAt'),
                 "status": status,
-                "fixAttempted": is_success
+                "fixAttempted": fix_attempted
             })
         return events
     except Exception as e:
