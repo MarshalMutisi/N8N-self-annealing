@@ -5,6 +5,7 @@ import os
 import requests
 import json
 from dotenv import load_dotenv
+from execution.ai_healer import consult_gemini_for_fix
 
 load_dotenv()
 
@@ -35,7 +36,8 @@ def load_heal_log():
             return json.load(f)
     return []
 
-# --- Helper Logic Reused from monitor_and_heal.py ---
+# --- Shared Logic from core_healer ---
+from execution.core_healer import heal_workflow, get_workflow, get_workflow as get_workflow_detail
 
 workflow_cache = {}
 
@@ -43,20 +45,15 @@ def get_workflow_name(workflow_id):
     if workflow_id in workflow_cache:
         return workflow_cache[workflow_id]
     
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
-    
-    try:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            name = resp.json().get('name', f"Workflow {workflow_id}")
-            workflow_cache[workflow_id] = name
-            return name
-        return f"Workflow {workflow_id}"
-    except:
-        return f"Workflow {workflow_id}"
+    workflow = get_workflow(workflow_id)
+    if workflow:
+        name = workflow.get('name', f"Workflow {workflow_id}")
+        workflow_cache[workflow_id] = name
+        return name
+    return f"Workflow {workflow_id}"
 
 def find_error_recursive(data):
+    # This is still needed locally for scanning execution logs in get_events
     if isinstance(data, dict):
         if 'error' in data:
             err = data['error']
@@ -72,134 +69,6 @@ def find_error_recursive(data):
             found = find_error_recursive(item)
             if found: return found
     return None
-
-# ========== TRUE AUTO-HEALING FUNCTIONS ==========
-
-import re
-import subprocess
-
-def get_workflow(workflow_id):
-    """Fetch full workflow JSON from n8n"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code == 200:
-        return resp.json()
-    return None
-
-def update_workflow(workflow_id, workflow_data):
-    """Update workflow in n8n via PATCH (saves draft in v2.0)"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}"
-    headers = {"X-N8N-API-KEY": N8N_KEY, "Content-Type": "application/json"}
-    resp = requests.put(url, headers=headers, json=workflow_data)
-    if resp.status_code in [200, 201]:
-        return True, "Updated successfully"
-    return False, f"Failed (Status {resp.status_code}): {resp.text}"
-
-def publish_workflow(workflow_id):
-    """Explicitly publish workflow so fix goes live (n8n v2.0+ requirement)"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}/activate"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
-    resp = requests.post(url, headers=headers)
-    return resp.status_code in [200, 201]
-
-def kill_port_process(port=3000):
-    """Layer 3: Local execution to clear blocked ports (Windows)"""
-    try:
-        cmd = f"Stop-Process -Id (Get-NetTCPConnection -LocalPort {port}).OwningProcess -Force"
-        subprocess.run(["powershell", "-Command", cmd], check=True, capture_output=True)
-        return True, f"Port {port} cleared"
-    except subprocess.CalledProcessError as e:
-        return False, f"Failed to kill port: {e.stderr.decode() if e.stderr else str(e)}"
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-def restart_services():
-    """Layer 3: Restart the FastAPI and Next.js services"""
-    try:
-        cmd = 'cd c:\\Users\\marsh\\Desktop\\leads; python run_workflow.py'
-        subprocess.Popen(["powershell", "-Command", cmd], creationflags=subprocess.CREATE_NEW_CONSOLE)
-        return True, "Services restarting in new window"
-    except Exception as e:
-        return False, f"Failed to restart: {str(e)}"
-
-def fix_javascript_syntax(code: str) -> tuple[str, bool]:
-    """
-    Attempt to fix common JavaScript syntax errors.
-    Returns (fixed_code, was_modified)
-    """
-    original = code
-    
-    # Fix 1: Remove stray brackets in property names (e.g., myNe]wField -> myNewField)
-    code = re.sub(r'\.(\w*)\](\w+)', r'.\1\2', code)
-    
-    # Fix 2: Remove random brackets in variable names
-    code = re.sub(r'(\w+)\](\w+)', r'\1\2', code)
-    code = re.sub(r'(\w+)\[(\w+)(?!\])', r'\1\2', code)  # Unclosed brackets
-    
-    # Fix 3: Fix unclosed strings (simple case)
-    # Count quotes - if odd number, add closing quote at end of line
-    lines = code.split('\n')
-    fixed_lines = []
-    for line in lines:
-        single_quotes = line.count("'") - line.count("\\'")
-        double_quotes = line.count('"') - line.count('\\"')
-        if single_quotes % 2 == 1:
-            line = line.rstrip() + "'"
-        if double_quotes % 2 == 1:
-            line = line.rstrip() + '"'
-        fixed_lines.append(line)
-    code = '\n'.join(fixed_lines)
-    
-    # Fix 4: Remove duplicate semicolons
-    code = re.sub(r';;+', ';', code)
-    
-    # Fix 5: Fix .ll() typo (common test case)
-    code = code.replace(".ll()", ".all()")
-    
-    return code, code != original
-
-def fix_code_node_in_workflow(workflow_id) -> tuple[bool, str]:
-    """
-    Fetch workflow, find Code nodes, fix syntax errors, update workflow.
-    Returns (success, message)
-    """
-    workflow = get_workflow(workflow_id)
-    if not workflow:
-        return False, "Could not fetch workflow"
-    
-    nodes = workflow.get('nodes', [])
-    fixed_any = False
-    fixed_nodes = []
-    
-    for node in nodes:
-        if node.get('type') == 'n8n-nodes-base.code':
-            params = node.get('parameters', {})
-            js_code = params.get('jsCode', '')
-            
-            if js_code:
-                fixed_code, was_modified = fix_javascript_syntax(js_code)
-                if was_modified:
-                    params['jsCode'] = fixed_code
-                    node['parameters'] = params
-                    fixed_any = True
-                    fixed_nodes.append(node.get('name', 'Unknown'))
-    
-    if fixed_any:
-        # Update the workflow
-        update_data = {
-            "nodes": nodes,
-            "connections": workflow.get('connections', {}),
-            "settings": workflow.get('settings', {}),
-            "name": workflow.get('name')
-        }
-        success, msg = update_workflow(workflow_id, update_data)
-        if success:
-            return True, f"✅ Fixed code in nodes: {', '.join(fixed_nodes)}"
-        else:
-            return False, f"Failed to update workflow: {msg}"
-    
-    return False, "No fixable code issues found"
 
 def get_real_error_message(execution_id):
     url = f"{N8N_URL}/api/v1/executions/{execution_id}?includeData=true"
@@ -252,11 +121,9 @@ def get_events():
                 error_msg = "Completed Successfully"
                 fix_attempted = True
             elif n8n_status in ['running', 'waiting']:
-                status = "Running" # Frontend might interpret this as Detected/Red, which is fine for now or can be added
+                status = "Running"
                 error_msg = "Execution in progress..."
             else:
-                # It's an error (crashed, error, failed)
-                # Fetch detailed error message
                 status = "Detected"
                 try:
                     error_msg = get_real_error_message(exec_id)
@@ -293,90 +160,13 @@ def get_event_detail(execution_id: str):
 @app.post("/api/heal")
 def heal_event(request: HealRequest):
     """
-    Self-Annealing Logic per directives/self_annealing.md
-    Attempts auto-fix or returns step-by-step explanation.
+    Refactored to use shared core_healer logic.
     """
-    error_lower = request.error.lower()
-    headers = {"X-N8N-API-KEY": N8N_KEY}
-    
-    # ========== AUTO-FIXABLE ERRORS ==========
-    
-    # 0. Port Already In Use -> Kill process (OS-level fix)
-    if any(pattern in error_lower for pattern in ["port already in use", "eaddrinuse", "address already in use"]):
-        success, msg = kill_port_process(3000)
-        if success:
-            restart_success, restart_msg = restart_services()
-            return {"status": "resolved", "message": f"✅ {msg}. {restart_msg}"}
-        return {"status": "explained", "message": f"⚠️ {msg}. Manual fix: Run `taskkill /F /IM node.exe`"}
-    
-    # 1. Connection / Network Issues -> Retry Execution
-    if any(pattern in error_lower for pattern in ["connection refused", "timeout", "econnreset", "network error"]):
-        retry_url = f"{N8N_URL}/api/v1/executions/{request.executionId}/retry"
-        try:
-            resp = requests.post(retry_url, headers=headers)
-            if resp.status_code in [200, 201]:
-                return {"status": "resolved", "message": "✅ Auto-Retry triggered. Connection issues often resolve on retry."}
-        except:
-            pass
-        return {"status": "resolved", "message": "✅ Retry request sent. If issue persists, check external service health."}
-    
-    # 2. Rate Limiting -> Advise Wait Strategy
-    if any(pattern in error_lower for pattern in ["rate limit", "429", "quota exceeded", "too many requests"]):
-        return {
-            "status": "resolved", 
-            "message": "✅ Rate limit detected. RECOMMENDED: Add a 'Wait' node before API calls. Set delay to 1-5 seconds."
-        }
-    
-    # ========== EXPLAINABLE ERRORS ==========
-    
-    # 3. JSON / Syntax Errors -> TRUE AUTO-FIX + PUBLISH
-    if any(pattern in error_lower for pattern in ["json", "parse", "syntax", "unexpected token"]):
-        # Attempt to actually fix the code in the workflow
-        success, message = fix_code_node_in_workflow(request.workflowId)
-        if success:
-            # n8n v2.0: Must publish after update for changes to go live
-            publish_workflow(request.workflowId)
-            return {"status": "resolved", "message": f"{message} (Published to n8n)"}
-        else:
-            # Fallback to explanation if auto-fix failed
-            return {
-                "status": "explained",
-                "message": f"⚠️ Auto-fix attempted but: {message}\n\nManual fix:\n1. Open the failing Code node.\n2. Check for typos like stray brackets or unclosed quotes.\n3. Validate syntax."
-            }
-    
-    # 4. Authentication Errors
-    if any(pattern in error_lower for pattern in ["401", "unauthorized", "invalid credentials", "forbidden", "403"]):
-        return {
-            "status": "explained",
-            "message": "🔐 Authentication Error:\n1. Go to n8n → Settings → Credentials.\n2. Find the credential used by this workflow.\n3. Re-enter or refresh the API key.\n4. Test the connection."
-        }
-    
-    # 5. Undefined Variables / Missing Data
-    if any(pattern in error_lower for pattern in ["undefined", "cannot read property", "null", "is not defined"]):
-        return {
-            "status": "explained",
-            "message": "⚠️ Data Flow Issue:\n1. Check the node BEFORE the failing one.\n2. Ensure it outputs the expected fields.\n3. Use 'Set' node to provide default values if data might be empty."
-        }
-    
-    # 6. HTTP 404 / Not Found
-    if any(pattern in error_lower for pattern in ["404", "not found", "endpoint"]):
-        return {
-            "status": "explained",
-            "message": "🔍 Resource Not Found:\n1. Verify the URL in the HTTP Request node.\n2. Check if the API endpoint has changed.\n3. Confirm the resource ID exists in the target system."
-        }
-    
-    # 7. Workflow Configuration Issues
-    if any(pattern in error_lower for pattern in ["disabled", "inactive", "no trigger"]):
-        return {
-            "status": "explained",
-            "message": "⚙️ Workflow Configuration:\n1. Open the workflow in n8n.\n2. Ensure all required nodes are ENABLED.\n3. Check that a trigger node exists and is active."
-        }
-    
-    # ========== DEFAULT FALLBACK ==========
-    return {
-        "status": "explained",
-        "message": f"🛠️ Manual Review Required:\nThis error type is not yet in our auto-fix library.\nWorkflow ID: {request.workflowId}\nError: {request.error}\n\nPlease inspect the workflow execution logs in n8n directly."
-    }
+    try:
+        result = heal_workflow(request.workflowId, request.executionId, request.error)
+        return result
+    except Exception as e:
+        return {"status": "explained", "message": f"Error during healing: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn

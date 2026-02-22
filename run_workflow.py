@@ -18,14 +18,13 @@ def start_healer():
 
 def start_frontend():
     print(">>> Starting Next.js Frontend on Port 3000...")
-    os.chdir("dashboard_next")
-    # Windows requires shell=True for npm, typically
-    subprocess.run("npm run dev", shell=True)
+    # Use cwd parameter instead of os.chdir to avoid directory pollution
+    subprocess.run("npm run dev", shell=True, cwd="dashboard_next")
 
 def main():
     print("="*60)
     print("   n8n HEAS (Healing & Error Analysis System)")
-    print("   Architecture: FastAPI (Py) + Next.js (TS) + n8n API + Agentic Healer")
+    print("   Architecture: FastAPI (Py) + Next.js (TS) + n8n API + Agentic Healer + MCP Server")
     print("="*60)
     
     # Start Backend in a separate thread
@@ -33,14 +32,17 @@ def main():
     backend_thread.daemon = True
     backend_thread.start()
 
-    # Start Healer in a separate thread
+    # Start Healer (Monitor) in a separate thread
     healer_thread = threading.Thread(target=start_healer)
     healer_thread.daemon = True
     healer_thread.start()
     
+    # Note: MCP Server is not started here because it is a stdio-based server 
+    # that should be invoked by the AI Client (Claude Desktop or Cursor).
+    
     time.sleep(2) # Give backend a moment
     
-    # Start Frontend in main thread (or separate, but let's block on one)
+    # Start Frontend in main thread
     start_frontend()
 
 if __name__ == "__main__":
