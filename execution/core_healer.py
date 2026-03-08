@@ -2,7 +2,6 @@ import os
 import json
 import requests
 import re
-import subprocess
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
@@ -17,39 +16,53 @@ except ImportError:
 
 load_dotenv()
 
-N8N_URL = os.getenv("N8N_API_URL")
-N8N_KEY = os.getenv("N8N_API_KEY")
+# Fallback globals for backward compatibility (agentic_healer, MCP server, etc.)
+_DEFAULT_N8N_URL = os.getenv("N8N_API_URL")
+_DEFAULT_N8N_KEY = os.getenv("N8N_API_KEY")
 
-def get_workflow(workflow_id: str) -> Optional[Dict]:
+
+def _resolve_creds(n8n_url: Optional[str] = None, n8n_key: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve n8n credentials: use provided ones or fall back to env vars."""
+    url = n8n_url or _DEFAULT_N8N_URL
+    key = n8n_key or _DEFAULT_N8N_KEY
+    if not url or not key:
+        raise ValueError("n8n URL and API Key are required. Provide them in the request or set N8N_API_URL/N8N_API_KEY env vars.")
+    return url, key
+
+
+def get_workflow(workflow_id: str, n8n_url: str = None, n8n_key: str = None) -> Optional[Dict]:
     """Fetch full workflow JSON from n8n"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
+    url, key = _resolve_creds(n8n_url, n8n_key)
+    endpoint = f"{url}/api/v1/workflows/{workflow_id}"
+    headers = {"X-N8N-API-KEY": key}
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(endpoint, headers=headers, timeout=10)
         if resp.status_code == 200:
             return resp.json()
     except Exception as e:
         print(f"Error fetching workflow {workflow_id}: {e}")
     return None
 
-def update_workflow(workflow_id: str, workflow_data: Dict) -> Tuple[bool, str]:
+def update_workflow(workflow_id: str, workflow_data: Dict, n8n_url: str = None, n8n_key: str = None) -> Tuple[bool, str]:
     """Update workflow in n8n"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}"
-    headers = {"X-N8N-API-KEY": N8N_KEY, "Content-Type": "application/json"}
+    url, key = _resolve_creds(n8n_url, n8n_key)
+    endpoint = f"{url}/api/v1/workflows/{workflow_id}"
+    headers = {"X-N8N-API-KEY": key, "Content-Type": "application/json"}
     try:
-        resp = requests.put(url, headers=headers, json=workflow_data, timeout=10)
+        resp = requests.put(endpoint, headers=headers, json=workflow_data, timeout=10)
         if resp.status_code in [200, 201]:
             return True, "Updated successfully"
         return False, f"Failed (Status {resp.status_code}): {resp.text}"
     except Exception as e:
         return False, f"Error updating workflow: {e}"
 
-def publish_workflow(workflow_id: str) -> bool:
+def publish_workflow(workflow_id: str, n8n_url: str = None, n8n_key: str = None) -> bool:
     """Explicitly publish/activate workflow"""
-    url = f"{N8N_URL}/api/v1/workflows/{workflow_id}/activate"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
+    url, key = _resolve_creds(n8n_url, n8n_key)
+    endpoint = f"{url}/api/v1/workflows/{workflow_id}/activate"
+    headers = {"X-N8N-API-KEY": key}
     try:
-        resp = requests.post(url, headers=headers, timeout=10)
+        resp = requests.post(endpoint, headers=headers, timeout=10)
         return resp.status_code in [200, 201]
     except:
         return False
@@ -86,13 +99,13 @@ def fix_javascript_syntax(code: str) -> Tuple[str, bool]:
     
     return code, code != original
 
-def deterministic_fix(workflow_id: str, error_msg: str) -> Tuple[bool, str]:
+def deterministic_fix(workflow_id: str, error_msg: str, n8n_url: str = None, n8n_key: str = None) -> Tuple[bool, str]:
     """Attempt deterministic fixes based on error patterns."""
     error_lower = error_msg.lower()
     
     # 1. JSON / Syntax Errors
     if any(pattern in error_lower for pattern in ["json", "parse", "syntax", "unexpected token", "is not a function", "not defined"]):
-        workflow = get_workflow(workflow_id)
+        workflow = get_workflow(workflow_id, n8n_url, n8n_key)
         if not workflow:
             return False, "Could not fetch workflow for fixing."
         
@@ -119,9 +132,9 @@ def deterministic_fix(workflow_id: str, error_msg: str) -> Tuple[bool, str]:
                 "settings": workflow.get('settings', {}),
                 "name": workflow.get('name')
             }
-            success, msg = update_workflow(workflow_id, update_data)
+            success, msg = update_workflow(workflow_id, update_data, n8n_url, n8n_key)
             if success:
-                publish_workflow(workflow_id)
+                publish_workflow(workflow_id, n8n_url, n8n_key)
                 return True, f"✅ Fixed code in nodes: {', '.join(fixed_nodes)} (Published)"
             else:
                 return False, f"Failed to update workflow: {msg}"
@@ -136,20 +149,23 @@ def deterministic_fix(workflow_id: str, error_msg: str) -> Tuple[bool, str]:
 
     return False, "No deterministic fix found."
 
-def heal_workflow(workflow_id: str, execution_id: str, error_msg: str) -> Dict:
+def heal_workflow(workflow_id: str, execution_id: str, error_msg: str, n8n_url: str = None, n8n_key: str = None, gemini_api_key: str = None) -> Dict:
     """Main entry point for healing a workflow failure."""
     
+    # Resolve credentials once for the whole flow
+    url, key = _resolve_creds(n8n_url, n8n_key)
+    
     # Step 1: Try Deterministic Fixes
-    success, message = deterministic_fix(workflow_id, error_msg)
+    success, message = deterministic_fix(workflow_id, error_msg, url, key)
     if success:
         return {"status": "resolved", "message": message}
     
-    # Step 2: Try Connection/Network Retry (Special subset of deterministic)
+    # Step 2: Try Connection/Network Retry
     if any(pattern in error_msg.lower() for pattern in ["connection refused", "timeout", "econnreset", "network error"]):
-        retry_url = f"{N8N_URL}/api/v1/executions/{execution_id}/retry"
-        headers = {"X-N8N-API-KEY": N8N_KEY}
+        retry_endpoint = f"{url}/api/v1/executions/{execution_id}/retry"
+        headers = {"X-N8N-API-KEY": key}
         try:
-            resp = requests.post(retry_url, headers=headers, timeout=10)
+            resp = requests.post(retry_endpoint, headers=headers, timeout=10)
             if resp.status_code in [200, 201]:
                 return {"status": "resolved", "message": "✅ Auto-Retry triggered for network issue."}
         except:
@@ -157,9 +173,9 @@ def heal_workflow(workflow_id: str, execution_id: str, error_msg: str) -> Dict:
 
     # Step 3: AI Escalation (Gemini)
     print(f"🤖 Escalating to Gemini AI for {workflow_id}...")
-    workflow_json = get_workflow(workflow_id)
+    workflow_json = get_workflow(workflow_id, url, key)
     if workflow_json:
-        ai_success, explanation, fixed_workflow = consult_gemini_for_fix(workflow_json, error_msg)
+        ai_success, explanation, fixed_workflow = consult_gemini_for_fix(workflow_json, error_msg, gemini_api_key)
         if ai_success and fixed_workflow:
             update_data = {
                 "nodes": fixed_workflow.get("nodes", workflow_json.get("nodes", [])),
@@ -167,9 +183,9 @@ def heal_workflow(workflow_id: str, execution_id: str, error_msg: str) -> Dict:
                 "settings": fixed_workflow.get("settings", workflow_json.get("settings", {})),
                 "name": fixed_workflow.get("name", workflow_json.get("name"))
             }
-            update_success, update_msg = update_workflow(workflow_id, update_data)
+            update_success, update_msg = update_workflow(workflow_id, update_data, url, key)
             if update_success:
-                publish_workflow(workflow_id)
+                publish_workflow(workflow_id, url, key)
                 return {"status": "resolved", "message": f"🤖 Gemini AI fixed it: {explanation} (Published)"}
             else:
                 return {"status": "explained", "message": f"🤖 AI found fix but failed to apply: {update_msg}"}

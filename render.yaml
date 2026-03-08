@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: n8n-self-annealing
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: PORT
+        value: 8000
+    healthCheckPath: /api/health

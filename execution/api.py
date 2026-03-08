@@ -1,32 +1,48 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from typing import Optional
 import os
 import requests
 import json
 from dotenv import load_dotenv
-from execution.ai_healer import consult_gemini_for_fix
 
 load_dotenv()
 
 app = FastAPI()
 
-# Enable CORS for Next.js frontend
+# Enable CORS for development and Render deployment
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-N8N_URL = os.getenv("N8N_API_URL")
-N8N_KEY = os.getenv("N8N_API_KEY")
+# --- Shared Logic from core_healer ---
+from execution.core_healer import heal_workflow, get_workflow
+
+
+# --- Request Models ---
+class ConnectRequest(BaseModel):
+    n8nUrl: str
+    n8nApiKey: str
+    geminiApiKey: Optional[str] = None
 
 class HealRequest(BaseModel):
     executionId: str
     workflowId: str
     error: str
+    n8nUrl: str
+    n8nApiKey: str
+    geminiApiKey: Optional[str] = None
+
+class EventsRequest(BaseModel):
+    n8nUrl: str
+    n8nApiKey: str
 
 HEAL_LOG_FILE = ".tmp/heal_log.json"
 
@@ -36,24 +52,21 @@ def load_heal_log():
             return json.load(f)
     return []
 
-# --- Shared Logic from core_healer ---
-from execution.core_healer import heal_workflow, get_workflow, get_workflow as get_workflow_detail
-
 workflow_cache = {}
 
-def get_workflow_name(workflow_id):
-    if workflow_id in workflow_cache:
-        return workflow_cache[workflow_id]
+def get_workflow_name(workflow_id, n8n_url, n8n_key):
+    cache_key = f"{n8n_url}:{workflow_id}"
+    if cache_key in workflow_cache:
+        return workflow_cache[cache_key]
     
-    workflow = get_workflow(workflow_id)
+    workflow = get_workflow(workflow_id, n8n_url, n8n_key)
     if workflow:
         name = workflow.get('name', f"Workflow {workflow_id}")
-        workflow_cache[workflow_id] = name
+        workflow_cache[cache_key] = name
         return name
     return f"Workflow {workflow_id}"
 
 def find_error_recursive(data):
-    # This is still needed locally for scanning execution logs in get_events
     if isinstance(data, dict):
         if 'error' in data:
             err = data['error']
@@ -70,9 +83,9 @@ def find_error_recursive(data):
             if found: return found
     return None
 
-def get_real_error_message(execution_id):
-    url = f"{N8N_URL}/api/v1/executions/{execution_id}?includeData=true"
-    headers = {"X-N8N-API-KEY": N8N_KEY}
+def get_real_error_message(execution_id, n8n_url, n8n_key):
+    url = f"{n8n_url}/api/v1/executions/{execution_id}?includeData=true"
+    headers = {"X-N8N-API-KEY": n8n_key}
     try:
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
@@ -86,32 +99,67 @@ def get_real_error_message(execution_id):
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 # --- API Endpoints ---
 
-@app.get("/api/events")
-def get_events():
-    if not N8N_URL or not N8N_KEY:
-        raise HTTPException(status_code=500, detail="n8n credentials missing")
+@app.get("/api/health")
+def health_check():
+    """Health check for Render and uptime monitors."""
+    return {"status": "ok", "service": "HEAS - N8N Self-Annealing System"}
 
-    headers = {"X-N8N-API-KEY": N8N_KEY}
-    url = f"{N8N_URL}/api/v1/executions?limit=25&includeData=false"
+
+@app.post("/api/connect")
+def test_connection(req: ConnectRequest):
+    """Test if the provided n8n credentials are valid."""
+    headers = {"X-N8N-API-KEY": req.n8nApiKey}
+    try:
+        resp = requests.get(f"{req.n8nUrl}/api/v1/workflows?limit=1", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            workflows = resp.json().get('data', [])
+            return {"status": "connected", "message": f"Connected! Found {len(workflows)}+ workflows."}
+        elif resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Invalid API key.")
+        else:
+            raise HTTPException(status_code=resp.status_code, detail=f"n8n returned status {resp.status_code}")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=502, detail=f"Could not reach n8n at {req.n8nUrl}. Is the URL correct?")
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Connection to n8n timed out.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/events")
+def get_events(req: EventsRequest):
+    """Fetch workflow executions from the visitor's n8n instance."""
+    headers = {"X-N8N-API-KEY": req.n8nApiKey}
+    url = f"{req.n8nUrl}/api/v1/executions?limit=25&includeData=false"
 
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
              raise HTTPException(status_code=500, detail=f"n8n API Error: {response.status_code}")
         
         executions = response.json().get('data', [])
         events = []
+        seen_workflows = set()
+        
         for exc in executions:
-            name = get_workflow_name(exc.get('workflowId'))
+            workflow_id = exc.get('workflowId')
+            
+            # Only process the LATEST execution for each workflow
+            if workflow_id in seen_workflows:
+                continue
+            seen_workflows.add(workflow_id)
+            
+            name = get_workflow_name(workflow_id, req.n8nUrl, req.n8nApiKey)
             exec_id = exc.get('id')
             
-            # Check explicit status if available, fallback to finished bool
             n8n_status = exc.get('status', 'unknown')
             is_finished = exc.get('finished', False)
             
-            # Default values
             status = "Detected"
             error_msg = "Unknown Error"
             fix_attempted = False
@@ -126,13 +174,13 @@ def get_events():
             else:
                 status = "Detected"
                 try:
-                    error_msg = get_real_error_message(exec_id)
+                    error_msg = get_real_error_message(exec_id, req.n8nUrl, req.n8nApiKey)
                 except:
                     error_msg = "Execution Stopped/Crashed (Could not fetch details)"
 
             events.append({
                 "id": exec_id,
-                "workflowId": exc.get('workflowId'),
+                "workflowId": workflow_id,
                 "workflowName": name,
                 "error": error_msg,
                 "timestamp": exc.get('startedAt'),
@@ -140,6 +188,8 @@ def get_events():
                 "fixAttempted": fix_attempted
             })
         return events
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -151,22 +201,37 @@ def get_heals():
     except Exception as e:
         return []
 
-@app.get("/api/events/{execution_id}/detail")
-def get_event_detail(execution_id: str):
-    # Fetch the REAL error message on demand
-    real_error = get_real_error_message(execution_id)
-    return {"error": real_error}
-
 @app.post("/api/heal")
 def heal_event(request: HealRequest):
-    """
-    Refactored to use shared core_healer logic.
-    """
+    """Heal a workflow using the visitor's n8n credentials + visitor's Gemini key."""
     try:
-        result = heal_workflow(request.workflowId, request.executionId, request.error)
+        result = heal_workflow(
+            request.workflowId,
+            request.executionId,
+            request.error,
+            request.n8nUrl,
+            request.n8nApiKey,
+            request.geminiApiKey
+        )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         return {"status": "explained", "message": f"Error during healing: {str(e)}"}
+
+
+# --- Static File Serving (for Render monolith) ---
+# Mount the Next.js static export if it exists (production build)
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static_dashboard")
+if os.path.isdir(STATIC_DIR):
+    # Serve index.html at root
+    @app.get("/")
+    async def serve_root():
+        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    
+    # Serve static files for everything else
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn

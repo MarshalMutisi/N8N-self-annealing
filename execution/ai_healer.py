@@ -34,13 +34,17 @@ def get_working_model():
     print("❌ No working Gemini models found.")
     return None
 
-def consult_gemini_for_fix(workflow_json: dict, error_msg: str) -> tuple[bool, str, dict]:
+def consult_gemini_for_fix(workflow_json: dict, error_msg: str, api_key: str = None) -> tuple[bool, str, dict]:
     """
     Sends the broken workflow and error to Gemini to generate a fix.
     Returns: (success, explanation, fixed_workflow_json)
     """
-    if not GEMINI_API_KEY:
+    current_key = api_key or GEMINI_API_KEY
+    if not current_key:
         return False, "No Gemini API Key found", {}
+
+    # Configure the key for this request
+    genai.configure(api_key=current_key)
 
     # Improve: Cache the working model? For now, re-instantiating is fine.
     # To avoid delay, we will just try the main ones without pre-test in the real detailed call
